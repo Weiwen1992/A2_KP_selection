@@ -1,0 +1,519 @@
+   ---
+title: "kidney_A2_peptide_selection"
+author: Weiwen Zhang
+collaborator: Xueqiong Zhang
+format:
+  html:
+    toc: true
+    html-math-method: katex
+    css: styles.css
+    self-contained: true
+
+editor: visual
+code-fold: true
+toc-depth: 3
+toc-location: left
+
+
+execute:
+  echo: true
+  eval: true
+  warning: false
+---
+
+# Step 0: Constants
+
+## R libraries
+
+```{r, warning=FALSE}
+# basic
+library(janitor)
+library(quarto)
+library(reticulate)
+library(here)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(readxl)
+library(rstatix)
+library(ggpubr)
+library(gdata)
+library(cowplot)
+library(rlang)
+
+# table & figs
+library(DT)
+library(gridExtra)
+library(VennDiagram)
+
+# bioconductor
+library(artMS)
+library(Peptides)
+library(motifStack)
+
+# http
+library(httr)
+
+# workflow
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(rsvg)
+
+
+source("source_code/funcs4A2.R")
+```
+
+## Python libraries
+
+```{python}
+import sys
+import os
+import numpy as np
+import pandas as pd
+import scipy.sparse
+import multiprocessing
+import matplotlib.pyplot as plt
+```
+
+## Others
+
+```{r}
+# input/output path
+fd_in <- here("weiwen/allopeptide/data/raw/")
+
+
+# urls for python chunks
+base_url <- 'http://hla-ligand-atlas.org/rel/2020.12/'
+
+# reference
+hla_agg <- "ref/HLA_aggregated.tsv"
+prot_atlas <- "ref/proteinatlas.tsv"
+
+
+```
+
+# Step 1: Human Ligand Atlas
+
+Source data: [Human HLA Ligand Atlas](https://hla-ligand-atlas.org/welcome)
+
+1)  Dataframe 1 = select kidney-derived peptides from HLA-A\*02:01+ donors (Dataframe 1 is obtained from url link)
+
+2)  Dataframe 2 = select kidney-derived HLA-A\*02:01 strong / weak binders (Dataframe is obtained from website)
+
+3)  Choose peptides that appear in both dataframe 1 & dataframe 2
+
+4)  Choose public peptides (appear in at least 2 HLA-A\*02:01+ donors)
+
+```{python}
+
+## import raw dataframe
+peptides = pd.read_csv(base_url + 'peptides.tsv.gz', sep = '\t')
+donors = pd.read_csv(base_url + 'donors.tsv.gz', sep = '\t')
+sample_hits = pd.read_csv(base_url + 'sample_hits.tsv.gz', sep = '\t')
+protein_map = pd.read_csv(base_url + 'protein_map.tsv.gz',sep = '\t')
+
+## get A2 donors
+donors_A2 = donors[donors['hla_allele'] == 'A*02:01']['donor'].tolist()
+
+## merge dataframe peptides & sample_hits
+sample_hits2 = sample_hits.merge(peptides, on = 'peptide_sequence_id', how = 'left')
+
+
+## dataframe 1 = select kidney-derived peptides from A2 donors
+kidney_A2_nsubject = sample_hits2[(sample_hits['tissue'] == 'Kidney') & (sample_hits2['donor'].isin(donors_A2))]
+
+
+## dataframe 2 = select A2 strong / weak binders derived from kidney of A2 donors
+################################################################
+## (notice: affinity info can only be obstained from website) ##
+################################################################
+kidney_A2_sw = pd.read_csv(r.hla_agg, sep = '\t')
+
+## choose peptides appearing in both dataframe 1 & dataframe 2
+kidney_A2_sw_peptide = kidney_A2_sw['peptide_sequence'].tolist()
+
+kidney_A2_nsubject = kidney_A2_nsubject[kidney_A2_nsubject['peptide_sequence'].isin(kidney_A2_sw_peptide)]
+
+## choose public peptides
+kidney_A2_nsubject = kidney_A2_nsubject.groupby('peptide_sequence_id').agg(
+  nsubject = pd.NamedAgg(column = 'donor', aggfunc = lambda x: x.nunique())
+  )
+  
+kidney_A2_nsubject['peptide_sequence_id'] = kidney_A2_nsubject.index.to_list()
+kidney_A2_nsubject.index = list(range(0, kidney_A2_nsubject.shape[0]))
+```
+
+```{r}
+sample_hits = py$sample_hits2
+kidney_A2_nsubject = py$kidney_A2_nsubject
+protein = py$protein_map
+
+
+
+kidney_A2_nsubject = dplyr::left_join(kidney_A2_nsubject, sample_hits %>% dplyr::select(
+    peptide_sequence_id, peptide_sequence) %>% distinct(), by = "peptide_sequence_id")
+
+
+
+## add source protein column
+kidney_A2_nsubject = dplyr::left_join(kidney_A2_nsubject, protein, by = "peptide_sequence_id")
+
+cat("Unique peptide number")
+kidney_A2_nsubject %>%
+  distinct(peptide_sequence) %>% nrow()
+```
+
+# Step 2: Human Protein Atlas
+
+Source data: [Human Protein Atlas](https://www.proteinatlas.org/)
+
+Get source gene mRNA expression level in the following tissue / cell types:
+
+1)  Kidney
+
+2)  PTC (proximal tubular cell)
+
+3)  DTC (distal tubular cell)
+
+4)  CDC (collecting ductal cell)
+
+RTC (Renal Tubular Cells: PTC, DTC, CDC) are most likely to have rejection in kidney transplantation
+
+```{r}
+
+df = kidney_A2_nsubject
+
+
+hpa <- read_tsv(prot_atlas) %>% 
+        clean_names() %>%
+        select(gene, protein_name = gene_description, 
+               protein = uniprot, protein_class, biological_process,
+               molecular_function, 
+               subcellular_location,
+               subcellular_main_location,
+               subcellular_additional_location,
+               rna_kidney = tissue_rna_kidney_n_tpm,
+               rna_distal_tubular = single_cell_type_rna_distal_tubular_cells_n_tpm,
+               rna_proximal_tubular = single_cell_type_rna_proximal_tubular_cells_n_tpm,
+               rna_collecting_duct = single_cell_type_rna_collecting_duct_cells_n_tpm,
+               rna_endothelial = single_cell_type_rna_endothelial_cells_n_tpm)  
+
+
+df = kidney_A2_nsubject %>%
+  rename(protein = uniprot_id)
+
+
+df = dplyr::inner_join(df, hpa, by = "protein")
+
+
+## mer
+df$mer = nchar(df$peptide_sequence)
+
+## for peptide-protein matching
+df_map = df
+
+
+## for protein selection 
+df = df %>%
+  distinct(protein, protein_name, protein_class, gene, 
+           biological_process, molecular_function, 
+           subcellular_location, subcellular_main_location, subcellular_additional_location,
+           rna_kidney, rna_proximal_tubular, rna_distal_tubular, rna_collecting_duct, rna_endothelial)
+
+## add freq column
+df = df %>%
+  mutate(proximal_tubular_freq = 
+           rna_proximal_tubular / sum(df$rna_proximal_tubular) * 100) %>%
+  mutate(distal_tubular_freq = 
+           rna_distal_tubular / sum(df$rna_distal_tubular) * 100) %>%
+  mutate(collecting_duct_freq = 
+           rna_collecting_duct / sum(df$rna_collecting_duct) * 100)
+
+```
+
+# Step 3: Rank protein
+
+1)  Rank protein based on source gene mRNA expression level in PTC, DTC & CDC
+
+2)  Get a list of protein that, in descending order of expression level, account for 95% source gene mRNA cumulative frequency in PTC, DTC & CDC
+
+```{r}
+
+
+## how many protein in descending order of source gene mRNA expression level account for >90% cumulative frequency?
+
+num_PTC <- df %>%
+  arrange(desc(proximal_tubular_freq)) %>%
+  dplyr::slice(1:400) %>%
+  pull(proximal_tubular_freq) %>% sum()
+
+num_DTC <- df %>%
+  arrange(desc(distal_tubular_freq)) %>%
+  dplyr::slice(1:400) %>%
+  pull(distal_tubular_freq) %>% sum()
+
+num_CDC <- df %>%
+  arrange(desc(collecting_duct_freq)) %>%
+  dplyr::slice(1:700) %>%
+  pull(collecting_duct_freq) %>% sum()
+
+
+tbl_num <- data.frame(
+  num_PTC = round(num_PTC, 2),
+  num_DTC = round(num_DTC, 2),
+  num_CDC = round(num_CDC, 2))
+
+
+cat("Number of proteins in descending order of expression level account for >90% cumulative frequency")
+print(tbl_num)
+
+
+top_proximal_tubular = df %>%
+  arrange(desc(proximal_tubular_freq)) %>%
+  dplyr::slice(1:400) %>% 
+  pull(protein)
+
+
+top_distal_tubular = df %>% 
+  arrange(desc(distal_tubular_freq)) %>%
+  dplyr::slice(1:400) %>% 
+  pull(protein)
+
+
+
+top_collecting_duct = df %>% 
+  arrange(desc(collecting_duct_freq)) %>%
+  dplyr::slice(1:700) %>% 
+  pull(protein)
+
+
+
+
+```
+
+# Step 4: Venn analysis
+
+## Step 4.0: Function to display venn.diagram plot
+
+```{r}
+display_venn <- function(x, ...){
+  xlim <- c(0, 500)
+  ylim <- c(0, 500)
+  grid.newpage()
+  pushViewport(viewport( 
+    x = 0.5, y = 0.5, # a centered viewport
+    width = unit(min(1, diff(xlim)/diff(ylim)), "snpc"), # aspect ratio preserved
+    height = unit(min(1,diff(ylim)/diff(xlim)), "snpc"),
+    xscale = xlim, # cf. xlim
+    yscale = ylim  # cf. ylim
+))
+  venn_object <- venn.diagram(x, filename = NULL, ...)
+  grid.draw(venn_object)
+}
+
+```
+
+## Step 4.1: Get protein shared among PTC, DTC & CDC
+
+```{r}
+
+library(VennDiagram)
+
+## proximal vs distal vs collecting
+pdc = list(PTC = top_proximal_tubular,
+           DTC = top_distal_tubular,
+           CDC = top_collecting_duct)
+
+
+display_venn(pdc, 
+             fill = c("darkseagreen3", "lightskyblue1", "lightcoral"), 
+             fontfamily = "Arial",
+             cat.fontfamily = "Arial",
+             alpha = c(0.5, 0.5, 0.5), lwd = 0, 
+             force.unique = F,
+             cex = 2
+             )
+
+
+
+rtc_protein = intersect(intersect(pdc$PTC, pdc$DTC), pdc$CDC) 
+
+
+
+
+```
+
+## Step 4.2: Get cumulative frequency of source gene mRNA of selected protein in PTC, DTC & CDC
+
+```{r}
+
+
+df_rtc = df %>% dplyr::filter(protein %in% rtc_protein)
+
+
+
+df_rtc$proximal_tubular_freq_total = sum(df_rtc$proximal_tubular_freq)
+df_rtc$distal_tubular_freq_total = sum(df_rtc$distal_tubular_freq)
+df_rtc$collecting_duct_freq_total = sum(df_rtc$collecting_duct_freq)
+
+
+tbl_num_rtc <- data.frame(
+  CF_PTC = round(df_rtc$proximal_tubular_freq_total[1], 2),
+  CF_DTC = round(df_rtc$distal_tubular_freq_total[1], 2),
+  CF_CDC = round(df_rtc$collecting_duct_freq_total[1], 2))
+
+cat("Cumulative frequency of source gene mRNA of selected protein in PTC, DTC & CDC")
+print(tbl_num_rtc)
+
+
+```
+
+## Step 4.3: Get peptide list from selected protein
+
+```{r}
+df_rtc_pep = df_map %>% dplyr::filter(protein %in% rtc_protein)
+
+rtc_peptide = df_rtc_pep %>% pull(peptide_sequence) %>% unique()
+# how many unique peptides?
+length(rtc_peptide)
+
+df_map_select = df_map %>%
+  filter(protein %in% rtc_protein)
+
+```
+
+# Step 5: Select strong / weak binder to HLA-A\*02:01
+
+## Step 5.1: Get peptide affinity to HLA-A\*02:01
+
+Method: [IEDB database](http://tools.iedb.org/mhci/)
+
+Warning: Take a long time to run, comment out to save time during rendering
+
+```{r}
+
+{
+# variables used in iedb prediction
+fd_out <- "iedb_out/A0201/"
+
+
+alleles = "HLA-A*02:01"
+
+num_alleles <- length(alleles)
+
+pep_select = df_map_select %>% pull(peptide_sequence) %>% unique()
+pep_select_len = nchar(pep_select) %>% unique()
+
+for (k in pep_select_len) {
+
+url <- 'http://tools-cluster-interface.iedb.org/tools_api/mhci/'
+pred_len <- as.character(k)
+
+mth <- "netmhcpan"
+seqs <- df_map_select %>%
+  filter(mer == k) %>%
+  pull(peptide_sequence) %>%
+  unique()
+
+
+# variables used in the loop
+num_seq <- length(seqs)
+
+
+# for each peptide
+
+param2httr = list()
+
+for(i in 1:num_seq) {
+
+  for (j in 1:num_alleles) {
+
+    param2httr = list('method' = mth,
+                      'sequence_text' = as.character(seqs[i]),
+                      'allele' = as.character(alleles[j]),
+                      'length' = pred_len)
+
+    # send request to api
+    res_api <- httr::POST(url = url,
+                          body = param2httr)
+
+
+
+    # extract content from the request
+    cat(httr::content(res_api, "text"),
+        file = paste0(fd_out, seqs[i], "_", alleles[j], ".txt"))
+
+
+    Sys.sleep(0.8)
+
+  }
+
+}
+
+}
+
+
+}
+
+
+```
+
+## Step 5.2: Select strong / weak binder (IC50 \<= 255)
+
+```{r}
+
+
+iedb_result <- fd_out %>% 
+  fs::dir_ls(regexp = "\\.txt$") %>% 
+  map_dfr(.f = read.csv, sep = "\t", .id = "source") %>%
+  discard(~all(is.na(.x))) %>%
+  na.omit() %>%
+  dplyr::select(allele, peptide, ic50)
+
+
+
+A2_binder = iedb_result %>% 
+  filter(peptide %in% rtc_peptide) %>%
+  filter(ic50 <= 255) %>% pull(peptide)
+
+
+df_map_select_2 = df_map_select %>% filter(peptide_sequence %in% A2_binder)
+
+cat("Unique peptide number")
+df_map_select_2 %>%
+  distinct(peptide_sequence) %>% nrow()
+
+```
+
+# Step 6: Select 96 peptides with highest rank of source gene mRNA level in RTC
+
+```{r}
+
+
+df_map_select_2_protein = df_map_select_2 %>%
+  pull(protein) %>% unique()
+
+
+df_rank = df %>%
+  mutate(rank_PTC = rank(-rna_proximal_tubular)) %>%
+  mutate(rank_DTC = rank(-rna_distal_tubular)) %>%
+  mutate(rank_CDC = rank(-rna_collecting_duct)) %>%
+  rowwise() %>%
+  mutate(min_rank = min(rank_PTC, rank_DTC, rank_CDC)) %>%
+  ungroup() %>%
+  filter(protein %in% df_map_select_2_protein) %>%
+  arrange(min_rank) %>%
+  dplyr::slice(1:85) 
+  
+final_pep_select = df_map_select_2 %>%
+  filter(protein %in% df_rank$protein)
+
+cat("Number of unique peptides selected")
+
+final_pep_select %>%
+  distinct(peptide_sequence) %>%
+  nrow()
+
+
+```
