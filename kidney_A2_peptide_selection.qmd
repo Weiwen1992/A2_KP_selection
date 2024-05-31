@@ -79,16 +79,15 @@ import matplotlib.pyplot as plt
 ## Others
 
 ```{r}
-# input/output path
-fd_in <- here("weiwen/allopeptide/data/raw/")
 
 
 # urls for python chunks
 base_url <- 'http://hla-ligand-atlas.org/rel/2020.12/'
 
 # reference
-hla_agg <- "ref/HLA_aggregated.tsv"
-prot_atlas <- "ref/proteinatlas.tsv"
+hla_agg <- "HLA_aggregated.tsv"
+unzip("proteinatlas.tsv.zip")
+prot_atlas <- "proteinatlas.tsv"
 
 
 ```
